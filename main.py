@@ -1,0 +1,192 @@
+"""
+Personal Telegram File Locker Bot — entry point.
+
+Run with:  python main.py
+Requires BOT_TOKEN, OWNER_ID, and MONGO_URI in the environment (or a
+.env file).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+
+from telegram import BotCommand
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    CommandHandler,
+    MessageHandler,
+    PreCheckoutQueryHandler,
+    filters,
+)
+
+import handlers
+from config import (
+    BOT_COMMANDS,
+    BOT_TOKEN,
+    INGEST_QUEUE_MAXSIZE,
+    MAX_CONCURRENT_UPDATES,
+    MONGO_DB_NAME,
+    MONGO_URI,
+    OWNER_ID,
+    PREMIUM_MONTHLY_PRICE_STARS,
+)
+from db import Database
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
+class _RefundedPaymentFilter(filters.MessageFilter):
+    def filter(self, message) -> bool:
+        return getattr(message, "refunded_payment", None) is not None
+
+
+REFUNDED_PAYMENT_FILTER = _RefundedPaymentFilter(name="REFUNDED_PAYMENT")
+
+
+async def _post_init(application: Application) -> None:
+    """Open the MongoDB connection and register the command menu."""
+    db = Database(MONGO_URI, MONGO_DB_NAME, owner_id=OWNER_ID)
+    await db.connect()
+    application.bot_data["db"] = db
+    logger.info("Connected to MongoDB database '%s'", MONGO_DB_NAME)
+
+    # Automatically register all commands from config.BOT_COMMANDS so the
+    # "/" menu in Telegram is always up to date — no manual @BotFather step
+    # needed. Run /setcommands inside the bot to re-register at any time.
+    await application.bot.set_my_commands(
+        [BotCommand(name, desc) for name, desc in BOT_COMMANDS]
+    )
+    logger.info("Command menu registered: %s", [name for name, _ in BOT_COMMANDS])
+
+    application.bot_data["incoming_file_queue"] = asyncio.Queue(
+        maxsize=INGEST_QUEUE_MAXSIZE
+    )
+    # Keep this worker separate from Application.create_task: it is intentionally
+    # long-lived, and _post_stop signals it to drain and exit.
+    application.bot_data["incoming_file_worker"] = asyncio.create_task(
+        handlers.run_ingest_worker(application),
+        name="incoming-file-ingest-worker",
+    )
+    logger.info("File ingest queue ready (capacity=%s, workers=1)", INGEST_QUEUE_MAXSIZE)
+
+
+async def _post_stop(application: Application) -> None:
+    queue = application.bot_data.get("incoming_file_queue")
+    worker = application.bot_data.get("incoming_file_worker")
+    if queue is not None and worker is not None and not worker.done():
+        # FIFO sentinel: drain every file already accepted before exiting.
+        await queue.put(None)
+        await worker
+
+
+async def _post_shutdown(application: Application) -> None:
+    db: Database | None = application.bot_data.get("db")
+    if db is not None:
+        await db.close()
+
+
+def build_application() -> Application:
+    if not BOT_TOKEN:
+        sys.exit("ERROR: BOT_TOKEN is not set. Add it to your environment or .env file.")
+    if not OWNER_ID:
+        sys.exit("ERROR: OWNER_ID is not set. Add it to your environment or .env file.")
+    if not MONGO_URI:
+        sys.exit("ERROR: MONGO_URI is not set. Add it to your environment or .env file.")
+    if PREMIUM_MONTHLY_PRICE_STARS < 1 or PREMIUM_MONTHLY_PRICE_STARS > 10000:
+        sys.exit("ERROR: PREMIUM_MONTHLY_PRICE_STARS must be between 1 and 10000.")
+
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        # Keep update handling light; the separate worker serializes file writes.
+        .concurrent_updates(MAX_CONCURRENT_UPDATES)
+        .post_init(_post_init)
+        .post_stop(_post_stop)
+        .post_shutdown(_post_shutdown)
+        .build()
+    )
+
+    # ── Core commands ─────────────────────────────────────────────────────────
+    application.add_handler(CommandHandler(["start", "drive"], handlers.cmd_start))
+    application.add_handler(CommandHandler("stats",       handlers.cmd_stats))
+    application.add_handler(CommandHandler("search",      handlers.cmd_search))
+
+    # ── New feature commands ──────────────────────────────────────────────────
+    application.add_handler(CommandHandler("sections",    handlers.cmd_sections))
+    application.add_handler(CommandHandler("favourites",  handlers.cmd_favourites))
+    application.add_handler(CommandHandler(
+        ["favorites", "favs"],               # accept both spellings
+        handlers.cmd_favourites,
+    ))
+    application.add_handler(CommandHandler("recent",      handlers.cmd_recent))
+    application.add_handler(CommandHandler("setcommands", handlers.cmd_setcommands))
+    application.add_handler(CommandHandler("admin",       handlers.cmd_admin))
+    application.add_handler(CommandHandler("backup",      handlers.cmd_backup))
+    application.add_handler(CommandHandler("signup",      handlers.cmd_signup))
+    application.add_handler(CommandHandler("login",       handlers.cmd_login))
+    application.add_handler(CommandHandler("logout",      handlers.cmd_logout))
+    application.add_handler(CommandHandler("whoami",      handlers.cmd_whoami))
+    application.add_handler(CommandHandler("premium",     handlers.cmd_premium))
+    application.add_handler(CommandHandler("terms",       handlers.cmd_terms))
+    application.add_handler(CommandHandler("paysupport",  handlers.cmd_paysupport))
+
+    # Telegram Stars recurring-payment flow.
+    application.add_handler(PreCheckoutQueryHandler(handlers.handle_precheckout))
+    application.add_handler(MessageHandler(
+        filters.SUCCESSFUL_PAYMENT, handlers.handle_successful_payment
+    ))
+    application.add_handler(MessageHandler(
+        REFUNDED_PAYMENT_FILTER, handlers.handle_refunded_payment
+    ))
+
+    # ── Admin-promotion detection (powers "Backup Sources") ──────────────────
+    application.add_handler(ChatMemberHandler(
+        handlers.handle_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER
+    ))
+
+    # ── Incoming files ────────────────────────────────────────────────────────
+    file_filter = (
+        filters.Document.ALL
+        | filters.VIDEO
+        | filters.AUDIO
+        | filters.VOICE
+        | filters.PHOTO
+    )
+    application.add_handler(MessageHandler(file_filter, handlers.handle_incoming_file))
+
+    # ── Free text (rename / search / section-name awaiting input) ────────────
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handlers.handle_text
+    ))
+
+    # ── Inline keyboard taps ──────────────────────────────────────────────────
+    application.add_handler(CallbackQueryHandler(handlers.handle_callback))
+
+    return application
+
+
+def main() -> None:
+    application = build_application()
+    logger.info("Bot starting.")
+    application.run_polling(
+        allowed_updates=[
+            "message",
+            "channel_post",
+            "callback_query",
+            "my_chat_member",
+            "pre_checkout_query",
+        ]
+    )
+
+
+if __name__ == "__main__":
+    main()
