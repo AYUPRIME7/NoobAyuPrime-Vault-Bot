@@ -12,12 +12,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MONGO_URI = os.getenv("MONGO_URI", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8838748305:AAHwKnoS-wq3k6bpjA1RF_0GIsByB2KVOds").strip()
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://devilayush227_db_user:2LIDENsA70AnpWTa@cluster0.nv8dsfz.mongodb.net/?appName=Cluster0").strip()
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "file_locker").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_ID = int(os.getenv("OWNER_ID", "8493596199"))
 
-_archive_chat_id = os.getenv("IMPORT_ARCHIVE_CHAT_ID", "").strip()
+_archive_chat_id = os.getenv("IMPORT_ARCHIVE_CHAT_ID", "-1004470617003").strip()
 IMPORT_ARCHIVE_CHAT_ID = int(_archive_chat_id) if _archive_chat_id else None
 
 PAGE_SIZE = 10
